@@ -145,6 +145,11 @@ void OpenCL_Network<net_t>::forward(const std::vector<float>& input,
     ReportCUDAErrors(cudaMemcpy((void**)inBuffer,
               (net_t*)&net_t_input.data()[0], inSize, cudaMemcpyHostToDevice));
 
+    // Fused in_out transformation kernel is slower with big batch_sizes than
+    // calling out and in transformations separately.
+    // This condition could be tunable in future.
+    auto use_inout = (batch_size == 1);
+
     auto skip_in_trans = false;
     for (auto iter = cbegin(m_layers); iter != cend(m_layers); iter++) {
         const auto& layer = *iter;
@@ -156,7 +161,7 @@ void OpenCL_Network<net_t>::forward(const std::vector<float>& input,
             auto bn_weights = begin(layer.weights) + 1;
             auto skip_next_in_trans = false;
             if (niter->is_residual_block) {
-                skip_next_in_trans = true;
+                skip_next_in_trans = use_inout;
             }
 
             convolve3(opencl_context,
@@ -190,12 +195,12 @@ void OpenCL_Network<net_t>::forward(const std::vector<float>& input,
                       conv1_weights,
                       nullptr,
                       bn1_weights,
-                      skip_in_trans, true, false,
+                      skip_in_trans, use_inout, false,
                       batch_size);
 
             auto skip_next_in_trans = false;
             if (niter->is_residual_block) {
-                skip_next_in_trans = true;
+                skip_next_in_trans = use_inout;
             }
             convolve3(opencl_context,
                       layer.channels,
@@ -207,7 +212,7 @@ void OpenCL_Network<net_t>::forward(const std::vector<float>& input,
                       conv2_weights,
                       &inBuffer,
                       bn2_weights,
-                      true, skip_next_in_trans, true,
+                      use_inout, skip_next_in_trans, true,
                       batch_size);
             skip_in_trans = skip_next_in_trans;
         } else {
@@ -320,8 +325,6 @@ void OpenCL_Network<net_t>::convolve3(OpenCLContext & opencl_context,
     assert(wavefront_size != 0);
 
     constexpr auto tiles = WINOGRAD_P;
-    constexpr auto width = BOARD_SIZE;
-    constexpr auto height = BOARD_SIZE;
 
     auto wgs = ceilMultiple(batch_size * tiles, wavefront_size);
     auto wgs_single = ceilMultiple(tiles, wavefront_size);
@@ -333,88 +336,107 @@ void OpenCL_Network<net_t>::convolve3(OpenCLContext & opencl_context,
  //   cl::CommandQueue & queue = opencl_context.m_commandqueue;
 
     if (!skip_in_transform) {
-		in_transform_host(bufferIn, bufferV, channels, k_ceil, n_ceil, batch_size);
+
+        try {
+            in_transform_kernel.setArg(0, bufferIn);
+            in_transform_kernel.setArg(1, bufferV);
+            in_transform_kernel.setArg(2, channels);
+            in_transform_kernel.setArg(3, k_ceil);
+            in_transform_kernel.setArg(4, n_ceil);
+            in_transform_kernel.setArg(5, batch_size);
+
+            queue.enqueueNDRangeKernel(in_transform_kernel, cl::NullRange,
+                                       cl::NDRange(wgs, channels));
+        } catch (const cl::Error &e) {
+            std::cerr << "Error in convolve3/in: " << e.what() << ": "
+                << e.err() << std::endl;
+            throw;
+        }
     }
 
+    try {
+        sgemm_kernel.setArg(0, m_ceil);
+        sgemm_kernel.setArg(1, n_ceil);
+        sgemm_kernel.setArg(2, k_ceil);
+        sgemm_kernel.setArg(3, weights[0]);
+        sgemm_kernel.setArg(4, bufferV);
+        sgemm_kernel.setArg(5, bufferM);
 
-	//const auto offset_u = b * K * C;
-	//const auto offset_v = b * C * P;
-	//const auto offset_m = b * K * P;
-	//cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-	//			K, P, C,
-	//			1.0f,
-	//			&U[offset_u], K,
-	//			&V[offset_v], P,
-	//			0.0f,
-	//			&M[offset_m], P);
+        cl::NDRange local_sgemm = {mdimc, ndimc, 1};
 
-	auto alpha = 1.0f;
-	auto beta = 0.0f;
+        cl::NDRange size_sgemm = {(m_ceil * mdimc) / mwg,
+                                  (n_ceil * ndimc) / nwg,
+                                  cl::size_type(WINOGRAD_TILE)};
 
-	//cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t handle,
-    //                              cublasOperation_t transa,
-    //                              cublasOperation_t transb,
-    //                              int m, int n, int k,
-    //                              const float           *alpha,
-    //                              const float           *A, int lda,
-    //                              long long int          strideA,
-    //                              const float           *B, int ldb,
-    //                              long long int          strideB,
-    //                              const float           *beta,
-    //                              float                 *C, int ldc,
-    //                              long long int          strideC,
-    //                              int batchCount)
+        queue.enqueueNDRangeKernel(sgemm_kernel, cl::NullRange,
+                                   size_sgemm, local_sgemm);
+    } catch (const cl::Error &e) {
+        std::cerr << "Error in convolve3/sgemm: " << e.what() << ": "
+            << e.err() << std::endl;
+        throw;
+    }
 
-	// Weights: [36][channels][outputs] = [36][k_ceil][m_ceil]
-	// Input: [36][channels][tiles] = [36][k_ceil][n_ceil]
-	// Output: [36][outputs][tiles] = [36][m_ceil][n_ceil]
+    try {
+        if (fuse_in_transform) {
+            // TODO : Eventually this might also be something tuneable?
+            // Needs to match OUTIN_KWG in kernel
+            constexpr auto dim_size = 2;
+            out_transform_bn_in_kernel.setArg(0, bufferM);
+            if (store_inout) {
+                out_transform_bn_in_kernel.setArg(1, bufferOut);
+            } else {
+                out_transform_bn_in_kernel.setArg(1, nullptr);
+            }
+            out_transform_bn_in_kernel.setArg(2, bufferV);
+            out_transform_bn_in_kernel.setArg(3, outputs);
+            out_transform_bn_in_kernel.setArg(4, m_ceil);
+            out_transform_bn_in_kernel.setArg(5, n_ceil);
+            // k_ceil of the next convolution
+            auto k_ceil2 = int(ceilMultiple(ceilMultiple(outputs, kwg), vwm));
+            out_transform_bn_in_kernel.setArg(6, k_ceil2);
+            if (bufferResidual) {
+                out_transform_bn_in_kernel.setArg(7, *bufferResidual);
+            } else {
+                out_transform_bn_in_kernel.setArg(7, nullptr);
+            }
+            out_transform_bn_in_kernel.setArg(8, bn_weights[0]);
+            out_transform_bn_in_kernel.setArg(9, bn_weights[1]);
 
-	ReportCUBLASErrors(cublasSgemmStridedBatched(
-					   opencl_context.m_cublas, // handle
-					   CUBLAS_OP_N, // transa
-					   CUBLAS_OP_T, // transb
-					   m_ceil, // m
-					   n_ceil, // n
-					   k_ceil, // k
-					   &alpha, // alpha
-					   (float*)weights[0], // A
-					   m_ceil, // lda
-					   m_ceil * k_ceil, // strideA
-					   (float*)bufferV, // B
-					   n_ceil, // ldb
-					   n_ceil * k_ceil, // strideB
-					   &beta, // beta
-					   (float*)bufferM, // C
-					   m_ceil, // ldc
-					   m_ceil * n_ceil, // strideC
-					   WINOGRAD_TILE)); // batchCount
+            queue.enqueueNDRangeKernel(out_transform_bn_in_kernel,
+                                       cl::NullRange,
+                                       cl::NDRange(outputs, wgs_single, batch_size),
+                                       cl::NDRange(dim_size, wgs_single, 1));
+        } else {
+            out_transform_bn_kernel.setArg(0, bufferM);
+            out_transform_bn_kernel.setArg(1, bufferOut);
+            out_transform_bn_kernel.setArg(2, outputs);
+            out_transform_bn_kernel.setArg(3, m_ceil);
+            out_transform_bn_kernel.setArg(4, n_ceil);
+            out_transform_bn_kernel.setArg(5, batch_size);
+            if (bufferResidual) {
+                out_transform_bn_kernel.setArg(6, *bufferResidual);
+            } else {
+                out_transform_bn_kernel.setArg(6, nullptr);
+            }
+            out_transform_bn_kernel.setArg(7, bn_weights[0]);
+            out_transform_bn_kernel.setArg(8, bn_weights[1]);
 
-	//auto out_size = 20*m_ceil;
-	//std::vector<float> out_temp(out_size);
+            // Needs to match OUT_KWG, OUT_BWG in the kernel.
+            // This could be tuned.
+            cl::NDRange local_out = {32, 2};
 
-	//ReportCUDAErrors(cudaMemcpy(&out_temp.data()[0], bufferM,
-	//		  out_size * sizeof(float), cudaMemcpyDeviceToHost));
+            cl::NDRange global_out = {ceilMultiple(outputs, local_out[0]),
+                                      ceilMultiple(tiles * batch_size, local_out[1])};
 
-	//for (int i = 0; i < out_size/m_ceil; i++) {
-	//	myprintf("%f ", out_temp[i*m_ceil]);
-	//}
-	//myprintf("\n\n");
-
-	if (fuse_in_transform) {
-		// k_ceil of the next convolution
-        auto k_ceil2 = int(ceilMultiple(ceilMultiple(outputs, kwg), vwm));
-
-		fused_out_in_transform_host(bufferM, bufferOut, bufferV,
-									outputs, m_ceil,
-									n_ceil, k_ceil2,
-									bufferResidual, bn_weights[0],
-									bn_weights[1], batch_size);
-	} else {
-		out_transform_host(bufferM, bufferOut,
-						   outputs, m_ceil,
-						   n_ceil, batch_size,
-						   bufferResidual, bn_weights[0], bn_weights[1]);
-	}
+            queue.enqueueNDRangeKernel(out_transform_bn_kernel, cl::NullRange,
+                                       global_out,
+                                       local_out);
+        }
+    } catch (const cl::Error &e) {
+        std::cerr << "Error in convolve3/out: " << e.what() << ": "
+            << e.err() << std::endl;
+        throw;
+    }
 }
 
 template <typename net_t>
@@ -604,14 +626,22 @@ OpenCL<net_t>::OpenCL(int gpu, bool silent) {
 
         bool preferred = (gpu == id);
 
-        if ( (bandwidth > best_bandwidth) || preferred) {
-            best_bandwidth = bandwidth;
-            best_device = prop;
-            best_device_id = i;
-            if (preferred) {
-                best_bandwidth = std::numeric_limits<decltype(best_bandwidth)>::max();
-            } else {
-                best_bandwidth = bandwidth;
+            bool preferred = (gpu == id);
+
+            if (((this_score > best_score)
+                 && (d.getInfo<CL_DEVICE_TYPE>() != CL_DEVICE_TYPE_CPU))
+                || preferred) {
+                best_version = opencl_version;
+                best_platform = p;
+                best_device = d;
+                best_vendor = this_vendor;
+                if (preferred) {
+                    best_score =
+                        std::numeric_limits<decltype(best_score)>::max();
+                } else {
+                    best_score = this_score;
+                }
+                found_device = true;
             }
             found_device = true;
         }
@@ -636,8 +666,18 @@ void OpenCL<net_t>::initialize(const int channels) {
     (void)channels;
     process_tuners("");
 
-	// Hard coded for now
-    m_wavefront_size = 32;
+    auto t = Tuner<net_t>(*this, m_context, m_device);
+    auto sgemm_tuners =
+        t.load_sgemm_tuners(channels, WINOGRAD_P, channels, WINOGRAD_TILE);
+
+    // Some NVIDIA drivers are buggy and will fail to compile the rest of the
+    // kernels after a tuning run.
+    if (cfg_tune_only) {
+        // Originally this was an exit() but this will make the tuner
+        // only tune the first GPU.  Return instead.  Exit will be called
+        // after all GPUs are created.
+        return;
+    }
 
     // Build program for these specific devices
     //try {
