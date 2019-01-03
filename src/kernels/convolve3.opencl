@@ -16,8 +16,7 @@
     along with Leela Zero.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Enables loading of this file using the C++ pre-processor's #include (C++11 standard raw string
-// literal). Comment-out this line for syntax-highlighting when developing.
+//TODO: __constant define
 
 R"(
 
@@ -34,6 +33,7 @@ R"(
 #endif
 
 __constant real Bt[WINOGRAD_ALPHA * WINOGRAD_ALPHA] = \
+
                    {1.0f,  0.0f,     -5.0f/2.0f,  0.0f,      1.0f, 0.0f,
                     0.0f, -SQ2,      -2.0f,       SQ2/2.0f,  1.0f, 0.0f,
                     0.0f,  SQ2,      -2.0f,      -SQ2/2.0f,  1.0f, 0.0f,
@@ -61,7 +61,7 @@ void multiply_bt(
 }
 
 
-__constant real At[WINOGRAD_M * WINOGRAD_ALPHA] = \
+__device__ real At[WINOGRAD_M * WINOGRAD_ALPHA] = \
                    {1.0f, 1.0f,      1.0f,       1.0f,      1.0f,     0.0f,
                     0.0f, SQ2/2.0f, -SQ2/2.0f,   SQ2,      -SQ2,      0.0f,
                     0.0f, 1.0f/2.0f, 1.0f/2.0f,  2.0f,      2.0f,     0.0f,
@@ -95,7 +95,7 @@ void multiply_at(
     *o3 = o.w;
 }
 
-void __in_transform_eq(real x[WINOGRAD_ALPHA][WINOGRAD_ALPHA], __global net_t * restrict V, int offset, int CPpad) {
+__device__ void __in_transform_eq(real x[WINOGRAD_ALPHA][WINOGRAD_ALPHA], __global net_t * restrict V, int offset, int CPpad) {
 
     const int W = BOARD_SIZE;
     const int H = BOARD_SIZE;
@@ -340,9 +340,10 @@ __kernel void out_transform_fused_bn_in(
         const real mean = vload_net_t(k, means);
         const real scale_stddiv = vload_net_t(k, stddivs);
 
+
         real temp[WINOGRAD_M][WINOGRAD_ALPHA];
 
-        // M dimensions are [36, outputs, batch_size * tiles].
+      // M dimensions are [36, outputs, batch_size * tiles].
         // Plus zero padding from SGEMM.
 
         const int offset = block * Kpad + k;
@@ -440,5 +441,3 @@ __kernel void out_transform_fused_bn_in(
     }
 }
 
-// End of the C++11 raw string literal
-)"
